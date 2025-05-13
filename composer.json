@@ -1,0 +1,14 @@
+{
+    "name": "andydixon/chronotheus",
+    "description": "Prometheus proxy with historical series injection for Grafana",
+    "type": "project",
+    "require": {
+        "php": ">=7.4",
+        "guzzlehttp/guzzle": "^7.0"
+    },
+    "autoload": {
+        "psr-4": {
+            "Andydixon\\Chronotheus\\": "src/"
+        }
+    }
+}
