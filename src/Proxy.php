@@ -6,217 +6,192 @@ use GuzzleHttp\Client;
 use GuzzleHttp\Exception\GuzzleException;
 
 /**
- * Class Proxy
- * 
- * This class acts as a proxy for forwarding and transforming API requests to an upstream server.
- * It supports Prometheus-style queries and labels, with additional functionality for handling
- * historical data and synthetic labels. The proxy adjusts query parameters, forwards requests,
- * and processes responses to include custom labels or aggregated data.
- * 
- * Key Features:
- * - Handles Prometheus instant and range queries.
- * - Supports synthetic labels like `chrono_timeframe` and `lastMonthAverage`.
- * - Adjusts timestamps and deduplicates time-series data.
- * - Provides fallback proxying for unsupported paths.
- * 
- * Dependencies:
- * - GuzzleHttp\Client for making HTTP requests.
- * - PHP's built-in functions for parsing and manipulating data.
+ * Proxy Class (Chronotheus)
+ *
+ * Okay, so this is rewrite 6(?) and is basically a middle-man for Prometheus API calls. Why you may ask:
+ * it intercepts your queries, does some funky timestamp maths, and then splats out
+ * extra data slices so you can see "what happened now" vs "what happened 7, 14, 21, 28 days ago"
+ * (we call that 'chrono_timeframe' BTW).
+ *
+ * What it actually does:
+ *   - Listens at /<host>_<port>/api/v1/... and figures out if you want:
+ *     • Instant query ('/query') or  
+ *     • Range query ('/query_range') or  
+ *     • Labels ('/labels') or  
+ *     • Label values ('/label/{name}/values') or  
+ *     • Anything else (then it just proxies straight through, no fuss).
+ *
+ * Historical magic:
+ *   - Offsets: now, 7d, 14d, 21d, 28d (that’s 0, 7×24h, 14×24h, etc.)
+ *   - Shifts your time window back by each offset, fetches data in parallel,
+ *   - Shifts those timestamps forward so it "lines up" with today,
+ *   - Tags each series with 'chrono_timeframe="current|7days|14days|21days|28days"'.
+ *
+ * Bonus series (because why not?):
+ *   - 'lastMonthAverage': per-metric minute-by-minute average of the four historical slices,
+ *   - 'compareAgainstLast28': raw difference (current minus average),
+ *   - 'percentCompareAgainstLast28': percent difference ((current−avg)/avg×100).
+ *
+ * Also supports:
+ *   - A '_command="whatever"' flag you can sneak into your PromQL and it’ll
+ *     carry that through on every returned series (like a little post-it note), but is also stored
+ *	   in $this->command so we could switch things off and on at the drop of a hat.
+ *   - JSON or form-encoded POST bodies or plain GET params,
+ *   - Smart stripping of those synthetic labels before contacting real Prometheus
+ *     (and cleaning up any leftover commas—no '{,foo="bar",}' crap that kept me up late at night).
+ *
+ * Under the hood:
+ *   - GuzzleHttp\Client for all the HTTP bits,
+ *   - PHP’s built-in parse_str / json_decode / strtotime / array magic to manipulate stuff,
+ *   - A bunch of helper methods to build query strings, dedupe series by label signature,
+ *     bucket & average points, subtract, percentify, etc.
+ *
+ * TLDR: It’s the lazy persons way of getting trend analysis data, makes five copies with different
+ * time offsets, glues them back together, and then throws in two more plots for comparison,
+ * all while quietly logging any upstream errors so I can finally sleep at night without dreaming of data.
  */
+
+
 class Proxy
 {
-    /** Offsets in seconds: 0d, 7d, 14d, 21d, 28d */
+    // Offsets in seconds: now, 7d, 14d, 21d, 28d
     private array $offsets = [
         0,
-        7 * 24 * 3600,
+        7  * 24 * 3600,
         14 * 24 * 3600,
         21 * 24 * 3600,
         28 * 24 * 3600,
     ];
 
-    /** Corresponding chrono_timeframe labels */
-    private array $historicals = [
-        "current",
-        "7days",
-        "14days",
-        "21days",
-        "28days",
+    // Labels we'll inject under "chrono_timeframe"
+    private array $timeframes = [
+        'current',
+        '7days',
+        '14days',
+        '21days',
+        '28days',
     ];
 
     /**
-     * Entrypoint: parse /<host>_<port>/ prefix, then dispatch.
-     * 
-     * @param string $uri The request URI.
-     * @param array $server Server variables, typically $_SERVER.
-     * @param string|null $body The raw request body, if any.
-     * 
-     * @return void
+     * Main router: peel off /<host>_<port>/, then dispatch.
      */
-    public function handle(
-        string $uri,
-        array $server,
-        ?string $body = null
-    ): void {
-        $path = parse_url($uri, PHP_URL_PATH) ?: "/";
+    public function handle(string $uri, array $server, ?string $body = null): void
+    {
+        $path = parse_url($uri, PHP_URL_PATH) ?: '/';
         if (!preg_match('#^/([^_/]+)_(\d+)(/.*)?$#', $path, $m)) {
             http_response_code(400);
-            header("Content-Type: application/json");
-            echo json_encode([
-                "status" => "error",
-                "error" => "Invalid target prefix",
-            ]);
+            header('Content-Type: application/json');
+            echo json_encode(['status'=>'error','error'=>'Invalid target prefix']);
             return;
         }
         [, $host, $port, $suffix] = $m;
-        $suffix = $suffix ?: "/";
+        $suffix   = $suffix ?: '/';
         $upstream = "http://{$host}:{$port}";
-        $method = strtoupper($server["REQUEST_METHOD"]);
+        $method   = strtoupper($server['REQUEST_METHOD']);
 
-        // route to the correct handler
-        if (
-            preg_match('#^/api/v1/query$#', $suffix) &&
-            in_array($method, ["GET", "POST"], true)
+        // dispatch by path and method
+        if (preg_match('#^/api/v1/query$#', $suffix) && in_array($method, ['GET','POST'], true)) {
+            $this->handleQuery($upstream, '/api/v1/query', $server, $body);
+
+        } elseif (preg_match('#^/api/v1/query_range$#', $suffix) && in_array($method, ['GET','POST'], true)) {
+            $this->handleQueryRange($upstream, '/api/v1/query_range', $server, $body);
+
+        } elseif (in_array($method, ['GET','POST'], true) && preg_match('#^/api/v1/labels/?$#', $suffix)) {
+            $this->handleLabels($upstream, '/api/v1/labels');
+
+        } elseif (in_array($method, ['GET','POST'], true)
+              && preg_match('#^/api/v1/label/([^/]+)/values/?$#', $suffix, $nm)
         ) {
-            $this->handleQuery($upstream, "/api/v1/query", $server, $body);
-        } elseif (
-            preg_match('#^/api/v1/query_range$#', $suffix) &&
-            in_array($method, ["GET", "POST"], true)
-        ) {
-            $this->handleQueryRange(
-                $upstream,
-                "/api/v1/query_range",
-                $server,
-                $body
-            );
-        } elseif (
-            in_array($method, ["GET", "POST"], true) &&
-            preg_match('#^/api/v1/labels/?$#', $suffix)
-        ) {
-            $this->handleLabels($upstream, "/api/v1/labels");
-        } elseif (
-            in_array($method, ["GET", "POST"], true) &&
-            preg_match('#^/api/v1/label/([^/]+)/values/?$#', $suffix, $nm)
-        ) {
-            $this->handleLabelValues(
-                $upstream,
-                "/api/v1/label/{$nm[1]}/values",
-                $nm[1]
-            );
+            $this->handleLabelValues($upstream, "/api/v1/label/{$nm[1]}/values", $nm[1]);
+
         } else {
+            // any other path → raw proxy
             $this->forward($upstream . $suffix, $method, $body);
         }
     }
 
     /**
-     * Instant query: /api/v1/query
-     * 
-     * Handles Prometheus instant queries by forwarding the request to the upstream server.
-     * Adjusts timestamps for historical data and aggregates results.
-     * 
-     * @param string $upstream The upstream server URL.
-     * @param string $path The API path to query.
-     * @param array $server Server variables, typically $_SERVER.
-     * @param string|null $body The raw request body, if any.
-     * 
-     * @return void
+     * Handle instant query at /api/v1/query
      */
-    private function handleQuery(
-        string $upstream,
-        string $path,
-        array $server,
-        ?string $body
-    ): void {
-        $method = strtoupper($server["REQUEST_METHOD"]);
-        $contentType = $server["CONTENT_TYPE"] ?? "";
-        $requestedHistorical = null;
+    private function handleQuery(string $upstream, string $path, array $server, ?string $body): void
+    {
+        $method = strtoupper($server['REQUEST_METHOD']);
+        $params = $this->parseClientParams();
 
-
-        // parse GET or JSON/form-POST params
-        if ($method === "POST") {
-            if (stripos($contentType, "application/json") !== false) {
-                $params = json_decode($body ?? "", true) ?: [];
-            } else {
-                parse_str($body ?? "", $params);
-            }
-        } else {
-            $params = $_GET;
-        }
-
-        if (
-            isset($params['query'])
-            && preg_match('/chrono_timeframe="([^"]+)"/', $params['query'], $m)
+        // catch any chrono_timeframe="..." or _command="..." user asked for
+        $requestedTf = null;
+        if (!empty($params['query'])
+            && preg_match('/\bchrono_timeframe="([^"]+)"/', $params['query'], $m1)
         ) {
-            $requestedHistorical = $m[1]; // e.g. "7days" or "lastMonthAverage"
+            $requestedTf = $m1[1];   // like "7days" or "lastMonthAverage"
+        }
+        $command = null;
+        if (!empty($params['query'])
+            && preg_match('/\b_command="([^"]+)"/', $params['query'], $m2)
+        ) {
+            $command = $m2[1];       // any flag you want to carry
         }
 
-        // strip any user-supplied chrono_timeframe matcher
-        $this->stripHistoricalFromParam($params, "query");
+        // strip those out before talking to Prometheus
+        $this->stripLabelFromParam($params, 'query', 'chrono_timeframe');
+        $this->stripLabelFromParam($params, 'query', 'command');
 
-        $client = new Client();
+        $client    = new Client();
         $allSeries = [];
 
-        // fetch 5 windows in parallel (0d, 7d, 14d, 21d, 28d)
+        // loop through now,7d,14d,21d,28d
         foreach ($this->offsets as $i => $offset) {
-            $histLabel = $this->historicals[$i];
+            $tfLabel        = $this->timeframes[$i];
+            // adjust the time backwards by offset
+            $tsEpoch        = $this->parseTime($params['time'] ?? null);
+            $params['time'] = $tsEpoch - $offset;
 
-            // adjust the 'time' param backward by $offset
-            $timeEpoch = $this->parseTime($params["time"] ?? null);
-            $params["time"] = $timeEpoch - $offset;
-
-            // upstream request
             try {
-                $resp = $client->request("GET", $upstream . $path, [
-                    "query" => $params,
+                $resp = $client->request('GET', $upstream . $path, [
+                    'query' => $params,
                 ]);
             } catch (GuzzleException $e) {
-                error_log(
-                    sprintf(
-                        "[Chrono][Upstream ERROR] %s %s?%s → %s",
-                        $method,
-                        $upstream . $path,
-                        http_build_query($params),
-                        $e->getMessage()
-                    )
-                );
+                error_log("[Chrono][Upstream ERROR] {$method} {$upstream}{$path}?{$this->buildQueryString($params)} → ".$e->getMessage());
                 http_response_code(502);
-                header("Content-Type: application/json");
-                echo json_encode([
-                    "status" => "error",
-                    "error" => "Upstream request failed",
-                ]);
+                header('Content-Type: application/json');
+                echo json_encode(['status'=>'error','error'=>'Upstream request failed']);
                 return;
             }
 
-            $data = json_decode($resp->getBody()->getContents(), true);
+            $data = json_decode($resp->getBody()->getContents(), true) ?: [];
+            if (empty($data['data']['result']) || !is_array($data['data']['result'])) {
+                // no results? meh, move on
+                continue;
+            }
 
-            // shift timestamps forward & tag, preserving string values
-            foreach ($data["data"]["result"] as $series) {
-                [$ts, $val] = $series["value"];
-                $series["value"] = [$ts + $offset, (string) $val];
-                $series["metric"]["chrono_timeframe"] = $histLabel;
+            // shift timestamps forward & tag
+            foreach ($data['data']['result'] as $series) {
+                [$ts, $val] = $series['value'];
+                $series['value'] = [
+                    $ts + $offset,
+                    (string)$val, // preserve JSON-string
+                ];
+                $series['metric']['chrono_timeframe'] = $tfLabel;
+                if ($command !== null) {
+                    $series['metric']['_command'] = $command;
+                }
                 $allSeries[] = $series;
             }
         }
 
-        // dedupe and build the lastMonthAverage series
+        // dedupe by metric signature (excluding synthetic labels)
         $merged = $this->dedupeSeries($allSeries);
-        $avgSeriesA = $this->buildLastMonthAverage($merged, false);
-        // append each per-signature average-series
-        foreach ($avgSeriesA as $avgSeries) {
-            $merged[] = $avgSeries;
-        }
 
-        // if they asked for a single chrono_timeframe slice, filter down to only that
-        if ($requestedHistorical !== null) {
+        // if they asked for one timeframe only, just filter and bail early
+        if ($requestedTf !== null) {
             $filtered = array_values(array_filter(
                 $merged,
-                fn($s) => ($s['metric']['chrono_timeframe'] ?? '') === $requestedHistorical
+                fn($s) => ($s['metric']['chrono_timeframe'] ?? '') === $requestedTf
             ));
-
             header('Content-Type: application/json');
             echo json_encode([
                 'status' => 'success',
-                'data' => [
+                'data'   => [
                     'resultType' => 'vector',
                     'result'     => $filtered,
                 ],
@@ -224,339 +199,449 @@ class Proxy
             return;
         }
 
+        // build lastMonthAverage per signature
+        $avgList = $this->buildLastMonthAverage($merged, false);
+        foreach ($avgList as $avg) {
+            if ($command !== null) {
+                $avg['metric']['_command'] = $command;
+            }
+            $merged[] = $avg;
+        }
 
+        // build compareAgainstLast28 (raw diff)
+        $curBySig = [];
+        foreach ($merged as $s) {
+            if (($s['metric']['chrono_timeframe'] ?? '') === 'current') {
+                $curBySig[$this->signature($s['metric'])] = $s;
+            }
+        }
+        $avgBySig = [];
+        foreach ($avgList as $s) {
+            $avgBySig[$this->signature($s['metric'])] = $s;
+        }
+        foreach ($curBySig as $sig => $curSeries) {
+            if (!isset($avgBySig[$sig])) {
+                continue;
+            }
+            $avgSeries = $avgBySig[$sig];
+            $metric    = $curSeries['metric'];
+            $metric['chrono_timeframe'] = 'compareAgainstLast28';
+            if ($command !== null) {
+                $metric['_command'] = $command;
+            }
+            [$tsc, $vc] = $curSeries['value'];
+            [,   $va]   = $avgSeries['value'];
+            $diff       = (float)$vc - (float)$va;
+            $merged[]   = [
+                'metric' => $metric,
+                'value'  => [(int)$tsc, (string)$diff],
+            ];
+        }
 
+        // now percentCompareAgainstLast28 ((cur-avg)/avg*100)
+        $percentList = [];
+        foreach ($curBySig as $sig => $curSeries) {
+            if (!isset($avgBySig[$sig])) {
+                continue;
+            }
+            $avgSeries = $avgBySig[$sig];
+            $metric    = $curSeries['metric'];
+            $metric['chrono_timeframe'] = 'percentCompareAgainstLast28';
+            if ($command !== null) {
+                $metric['_command'] = $command;
+            }
 
-        header("Content-Type: application/json");
+            [$tsc, $vc] = $curSeries['value'];
+            [,   $va]   = $avgSeries['value'];
+            if ((float)$va != 0.0) {
+                $pct = ((float)$vc - (float)$va) / (float)$va * 100;
+            } else {
+                // avoid divide by zero, ugh
+                $pct = 0.0;
+            }
+            $percentList[] = [
+                'metric' => $metric,
+                'value'  => [(int)$tsc, (string)$pct],
+            ];
+        }
+        foreach ($percentList as $p) {
+            $merged[] = $p;
+        }
+
+        // done! return the lot
+        header('Content-Type: application/json');
         echo json_encode([
-            "status" => "success",
-            "data" => [
-                "resultType" => "vector",
-                "result" => array_values($merged),
+            'status' => 'success',
+            'data'   => [
+                'resultType' => 'vector',
+                'result'     => array_values($merged),
             ],
         ]);
     }
 
     /**
-     * Range query: /api/v1/query_range
-     * 
-     * Handles Prometheus range queries by forwarding the request to the upstream server.
-     * Adjusts timestamps for historical data and aggregates results.
-     * 
-     * @param string $upstream The upstream server URL.
-     * @param string $path The API path to query.
-     * @param array $server Server variables, typically $_SERVER.
-     * @param string|null $body The raw request body, if any.
-     * 
-     * @return void
+     * Handle /api/v1/query_range (range queries)
      */
-    private function handleQueryRange(
-        string $upstream,
-        string $path,
-        array $server,
-        ?string $body
-    ): void {
-        $method = strtoupper($server["REQUEST_METHOD"]);
-        $contentType = $server["CONTENT_TYPE"] ?? "";
+    private function handleQueryRange(string $upstream, string $path, array $server, ?string $body): void
+    {
+        $method = strtoupper($server['REQUEST_METHOD']);
+        $params = $this->parseClientParams();
 
-        // parse GET or JSON/form-POST params
-        if ($method === "POST") {
-            if (stripos($contentType, "application/json") !== false) {
-                $params = json_decode($body ?? "", true) ?: [];
-            } else {
-                parse_str($body ?? "", $params);
-            }
-        } else {
-            $params = $_GET;
-        }
-
-        // detect if the user asked for a specific historical slice
-        $requestedHistorical = null;
-        if (
-            isset($params['query'])
-            && preg_match('/chrono_timeframe="([^"]+)"/', $params['query'], $m)
+        // grab any requested timeframe or command
+        $requestedTf = null;
+        if (!empty($params['query'])
+            && preg_match('/\bchrono_timeframe="([^"]+)"/', $params['query'], $m1)
         ) {
-            $requestedHistorical = $m[1]; // e.g. "7days" or "lastMonthAverage"
+            $requestedTf = $m1[1];
+        }
+        $command = null;
+        if (!empty($params['query'])
+            && preg_match('/\b_command="([^"]+)"/', $params['query'], $m2)
+        ) {
+            $command = $m2[1];
+        }
+        // strip them out
+        $this->stripLabelFromParam($params, 'query', 'chrono_timeframe');
+        $this->stripLabelFromParam($params, 'query', 'command');
+
+        // ensure a step
+        if (empty($params['step'])) {
+            $params['step'] = 60;
         }
 
-
-        // strip any user-supplied chrono_timeframe matcher
-        $this->stripHistoricalFromParam($params, "query");
-
-        // default step=60 if missing
-        if (empty($params["step"])) {
-            $params["step"] = 60;
-        }
-
-        $client = new Client();
+        $client    = new Client();
         $allSeries = [];
 
-        // fetch 5 windows
+        // same loop over offsets
         foreach ($this->offsets as $i => $offset) {
-            $histLabel = $this->historicals[$i];
-            if (@$_GET['ajdebug']) print_r("\n\n\n" . $histLabel . " offset: $offset" . " $i\n");
-            // shift start/end backwards
-            $params["start"] =
-                $this->parseTime($params["start"] ?? null) - $offset;
-            $params["end"] = $this->parseTime($params["end"] ?? null) - $offset;
-
+            $tfLabel           = $this->timeframes[$i];
+            $params['start'] = $this->parseTime($params['start'] ?? null) - $offset;
+            $params['end']   = $this->parseTime($params['end']   ?? null) - $offset;
 
             try {
-                $resp = $client->request("GET", $upstream . $path, [
-                    "query" => $params,
+                $resp = $client->request('GET', $upstream . $path, [
+                    'query' => $params,
                 ]);
             } catch (GuzzleException $e) {
-                error_log(
-                    sprintf(
-                        "[Chrono][Upstream ERROR] %s %s?%s → %s",
-                        $method,
-                        $upstream . $path,
-                        http_build_query($params),
-                        $e->getMessage()
-                    )
-                );
+                error_log("[Chrono][Upstream ERROR] {$method} {$upstream}{$path}?{$this->buildQueryString($params)} → ".$e->getMessage());
                 http_response_code(502);
-                header("Content-Type: application/json");
-                echo json_encode([
-                    "status" => "error",
-                    "error" => "Upstream request failed",
-                ]);
-
+                header('Content-Type: application/json');
+                echo json_encode(['status'=>'error','error'=>'Upstream request failed']);
                 return;
             }
 
-            $data = json_decode($resp->getBody()->getContents(), true);
+            $data = json_decode($resp->getBody()->getContents(), true) ?: [];
+            if (empty($data['data']['result']) || !is_array($data['data']['result'])) {
+                continue;
+            }
 
-            // shift + tag, preserving string values
-            foreach ($data["data"]["result"] as $series) {
+            // shift & tag each series
+            foreach ($data['data']['result'] as $series) {
                 $shifted = [];
-                foreach ($series["values"] as [$ts, $val]) {
-                    $shifted[] = [$ts + $offset, (string) $val];
+                foreach ($series['values'] as [$ts, $val]) {
+                    $shifted[] = [$ts + $offset, (string)$val];
                 }
-                $series["values"] = $shifted;
-                $series["metric"]["chrono_timeframe"] = $histLabel;
+                $series['values']                  = $shifted;
+                $series['metric']['chrono_timeframe'] = $tfLabel;
+                if ($command !== null) {
+                    $series['metric']['_command'] = $command;
+                }
                 $allSeries[] = $series;
-                if ($histLabel !== "current") {
-                    if (@$_GET['debug']) print_r($series);
-                }
             }
         }
 
-        // dedupe and build average
+        // dedupe
         $merged = $this->dedupeSeries($allSeries);
-        $avgSeriesA  = $this->buildLastMonthAverage($merged, true);
-        foreach ($avgSeriesA as $avgSeries) {
-            $merged[] = $avgSeries;
-        }
 
-
-
-        // if they asked for a single chrono_timeframe slice, filter down to only that
-        if ($requestedHistorical !== null) {
+        // timeframe filter shortcut
+        if ($requestedTf !== null) {
             $filtered = array_values(array_filter(
                 $merged,
-                fn($s) => ($s['metric']['chrono_timeframe'] ?? '') === $requestedHistorical
+                fn($s) => ($s['metric']['chrono_timeframe'] ?? '') === $requestedTf
             ));
-
             header('Content-Type: application/json');
             echo json_encode([
                 'status' => 'success',
-                'data' => [
-                    'resultType' => 'matrix',
-                    'result'     => $filtered,
+                'data'   => [
+                    'resultType'=>'matrix',
+                    'result'    =>$filtered,
                 ],
             ]);
             return;
         }
 
-        header("Content-Type: application/json");
+        // build averages
+        $avgList = $this->buildLastMonthAverage($merged, true);
+        foreach ($avgList as $avg) {
+            if ($command !== null) {
+                $avg['metric']['_command'] = $command;
+            }
+            $merged[] = $avg;
+        }
+
+        // raw diff
+        $curBySig = [];
+        foreach ($merged as $s) {
+            if (($s['metric']['chrono_timeframe'] ?? '') === 'current') {
+                $curBySig[$this->signature($s['metric'])] = $s;
+            }
+        }
+        $avgBySig = [];
+        foreach ($avgList as $s) {
+            $avgBySig[$this->signature($s['metric'])] = $s;
+        }
+        foreach ($curBySig as $sig => $curSeries) {
+            if (!isset($avgBySig[$sig])) {
+                continue;
+            }
+            $avgSeries = $avgBySig[$sig];
+            $metric    = $curSeries['metric'];
+            $metric['chrono_timeframe'] = 'compareAgainstLast28';
+            if ($command !== null) {
+                $metric['_command'] = $command;
+            }
+            $avgMap = [];
+            foreach ($avgSeries['values'] as [$ts, $v]) {
+                $avgMap[$ts] = (float)$v;
+            }
+            $diffVals = [];
+            foreach ($curSeries['values'] as [$ts, $v]) {
+                if (isset($avgMap[$ts])) {
+                    $delta = (float)$v - $avgMap[$ts];
+                    $diffVals[] = [$ts, (string)$delta];
+                }
+            }
+            $merged[] = [
+                'metric' => $metric,
+                'values' => $diffVals,
+            ];
+        }
+
+        // percent diff
+        $percentList = [];
+        foreach ($curBySig as $sig => $curSeries) {
+            if (!isset($avgBySig[$sig])) {
+                continue;
+            }
+            $avgSeries = $avgBySig[$sig];
+            $metric    = $curSeries['metric'];
+            $metric['chrono_timeframe'] = 'percentCompareAgainstLast28';
+            if ($command !== null) {
+                $metric['_command'] = $command;
+            }
+            $avgMap = [];
+            foreach ($avgSeries['values'] as [$ts, $v]) {
+                $avgMap[$ts] = (float)$v;
+            }
+            $pctVals = [];
+            foreach ($curSeries['values'] as [$ts, $v]) {
+                if (!isset($avgMap[$ts]) || $avgMap[$ts] == 0.0) {
+                    continue;
+                }
+                $pct = ((float)$v - $avgMap[$ts]) / $avgMap[$ts] * 100;
+                $pctVals[] = [$ts, (string)$pct];
+            }
+            $percentList[] = [
+                'metric' => $metric,
+                'values' => $pctVals,
+            ];
+        }
+        foreach ($percentList as $p) {
+            $merged[] = $p;
+        }
+
+        // send it back
+        header('Content-Type: application/json');
         echo json_encode([
-            "status" => "success",
-            "data" => [
-                "resultType" => "matrix",
-                "result" => array_values($merged),
+            'status' => 'success',
+            'data'   => [
+                'resultType' => 'matrix',
+                'result'     => array_values($merged),
             ],
         ]);
     }
 
     /**
-     * GET/POST /api/v1/labels — forward client params, then append chrono_timeframe
-     * 
-     * Processes label queries by forwarding the request to the upstream server.
-     * Ensures the `chrono_timeframe` label is included in the response.
-     * 
-     * @param string $upstream The upstream server URL.
-     * @param string $path The API path to query.
-     * 
-     * @return void
+     * Handle GET/POST /api/v1/labels — forward client filters, strip ours, then append.
      */
     private function handleLabels(string $upstream, string $path): void
     {
         $params = $this->parseClientParams();
-        $this->stripHistoricalFromMatches($params);
 
-        // Remap PHP’s "match" → "match[]" if needed
-        if (isset($params["match"]) && !isset($params["match[]"])) {
-            $params["match[]"] = $params["match"];
-            unset($params["match"]);
+        // strip any chrono_timeframe or command filters
+        $this->stripLabelFromParam($params, 'match', 'chrono_timeframe');
+        $this->stripLabelFromParam($params, 'match', 'command');
+
+        // remap PHP’s match→match[] if needed
+        if (isset($params['match']) && !isset($params['match[]'])) {
+            $params['match[]'] = $params['match'];
+            unset($params['match']);
         }
 
-        // Build the exact query string
-        $qs = $this->buildQueryString($params);
+        $qs  = $this->buildQueryString($params);
         $url = "{$upstream}{$path}?{$qs}";
 
         try {
-            $resp = (new Client())->request("GET", $url);
+            $resp = (new Client())->request('GET', $url);
         } catch (GuzzleException $e) {
-            error_log(
-                "[Chrono][Upstream ERROR] handleLabels → {$e->getMessage()}"
-            );
+            error_log("[Chrono][Upstream ERROR] handleLabels → ".$e->getMessage());
             http_response_code(502);
-            header("Content-Type: application/json");
-            echo json_encode([
-                "status" => "error",
-                "error" => "Upstream request failed",
-            ]);
+            header('Content-Type: application/json');
+            echo json_encode(['status'=>'error','error'=>'Upstream request failed']);
             return;
         }
 
-        $data = json_decode($resp->getBody()->getContents(), true);
-
-        // Ensure our pseudo-label is present
-        if (!isset($data["data"]) || !is_array($data["data"])) {
-            $data["status"] = "success";
-            $data["data"] = ["chrono_timeframe"];
-        } elseif (!in_array("chrono_timeframe", $data["data"], true)) {
-            $data["data"][] = "chrono_timeframe";
+        $data = json_decode($resp->getBody()->getContents(), true) ?: [];
+        // ensure the data array
+        if (!isset($data['data']) || !is_array($data['data'])) {
+            $data['data'] = [];
+            $data['status'] = 'success';
+        }
+        // append our label
+        if (!in_array('chrono_timeframe', $data['data'], true)) {
+            $data['data'][] = 'chrono_timeframe';
         }
 
-        header("Content-Type: application/json");
+        header('Content-Type: application/json');
         echo json_encode($data);
     }
 
     /**
-     * GET/POST /api/v1/label/{name}/values — forward client params minus chrono_timeframe
-     * 
-     * Processes label value queries by forwarding the request to the upstream server.
-     * Handles synthetic labels like `chrono_timeframe` and `lastMonthAverage`.
-     * 
-     * @param string $upstream The upstream server URL.
-     * @param string $path The API path to query.
-     * @param string $labelName The name of the label being queried.
-     * 
-     * @return void
+     * Handle GET/POST /api/v1/label/{name}/values — similar to labels.
      */
-    private function handleLabelValues(
-        string $upstream,
-        string $path,
-        string $labelName
-    ): void {
-        // Synthetic label
-        if ($labelName === "chrono_timeframe") {
-            header("Content-Type: application/json");
+    private function handleLabelValues(string $upstream, string $path, string $label): void
+    {
+        // synthetic label: list our timeframes + extras
+        if ($label === 'chrono_timeframe') {
+            header('Content-Type: application/json');
             echo json_encode([
-                "status" => "success",
-                "data" => array_merge($this->historicals, ["lastMonthAverage"]),
+                'status'=>'success',
+                'data'=>array_merge(
+                    $this->timeframes,
+                    ['lastMonthAverage','compareAgainstLast28','percentCompareAgainstLast28']
+                ),
             ]);
             return;
         }
 
         $params = $this->parseClientParams();
-        $this->stripHistoricalFromMatches($params);
-
-        // Remap PHP’s "match" → "match[]" if needed
-        if (isset($params["match"]) && !isset($params["match[]"])) {
-            $params["match[]"] = $params["match"];
-            unset($params["match"]);
+        $this->stripLabelFromParam($params, 'match', 'chrono_timeframe');
+        $this->stripLabelFromParam($params, 'match', 'command');
+        if (isset($params['match']) && !isset($params['match[]'])) {
+            $params['match[]'] = $params['match'];
+            unset($params['match']);
         }
 
-        $qs = $this->buildQueryString($params);
+        $qs  = $this->buildQueryString($params);
         $url = "{$upstream}{$path}?{$qs}";
 
         try {
-            $resp = (new Client())->request("GET", $url);
+            $resp = (new Client())->request('GET', $url);
         } catch (GuzzleException $e) {
-            error_log(
-                "[Chrono][Upstream ERROR] handleLabelValues → {$e->getMessage()}"
-            );
+            error_log("[Chrono][Upstream ERROR] handleLabelValues → ".$e->getMessage());
             http_response_code(502);
-            header("Content-Type: application/json");
-            echo json_encode([
-                "status" => "error",
-                "error" => "Upstream request failed",
-            ]);
+            header('Content-Type: application/json');
+            echo json_encode(['status'=>'error','error'=>'Upstream request failed']);
             return;
         }
 
-        $data = json_decode($resp->getBody()->getContents(), true);
-
-        header("Content-Type: application/json");
+        $data = json_decode($resp->getBody()->getContents(), true) ?: [];
+        header('Content-Type: application/json');
         echo json_encode($data);
     }
 
     /**
-     * Fallback proxy for all other paths.
-     * 
-     * Forwards unsupported paths to the upstream server without modification.
-     * 
-     * @param string $url The full URL to forward the request to.
-     * @param string $method The HTTP method (GET, POST, etc.).
-     * @param string|null $body The raw request body, if any.
-     * 
-     * @return void
+     * Raw proxy for anything else.
      */
     private function forward(string $url, string $method, ?string $body): void
     {
-        $client = new Client();
-        $opts = $method === "GET" ? ["query" => $_GET] : ["body" => $body];
-
-        $resp = $client->request($method, $url, $opts);
-
-        header("Content-Type: {$resp->getHeaderLine("Content-Type")}");
+        $opts = $method === 'GET' ? ['query'=>$_GET] : ['body'=>$body];
+        $resp = (new Client())->request($method, $url, $opts);
+        header("Content-Type: {$resp->getHeaderLine('Content-Type')}");
         echo $resp->getBody()->getContents();
     }
 
     /**
-     * Strip any chrono_timeframe="..." matcher from a PromQL param.
-     * 
-     * @param array $params The query parameters to modify.
-     * @param string $key The key of the parameter to strip.
-     * 
-     * @return void
+     * Parse client params: GET → $_GET, POST JSON → body, POST form → parse_str
      */
-    private function stripHistoricalFromParam(array &$params, string $key): void
+    private function parseClientParams(): array
+    {
+        $method      = $_SERVER['REQUEST_METHOD'] ?? 'GET';
+        $contentType = $_SERVER['CONTENT_TYPE']   ?? '';
+        $rawBody     = file_get_contents('php://input');
+
+        if ($method === 'POST') {
+            if (stripos($contentType, 'application/json') !== false) {
+                $d = json_decode($rawBody, true);
+                return is_array($d) ? $d : [];
+            }
+            parse_str($rawBody, $params);
+            return $params;
+        }
+        return $_GET;
+    }
+
+    /**
+     * Strip any ,?label="value" from $params[$key], clean up commas.
+     */
+    private function stripLabelFromParam(array &$params, string $key, string $label): void
     {
         if (!isset($params[$key])) {
             return;
         }
-        $params[$key] = preg_replace(
-            '/[, ]+?chrono_timeframe="[^"]*"/',
-            "",
-            $params[$key]
-        );
+        // remove the matcher
+        $pattern = '/,?'.preg_quote($label,'/').'="[^"]*"/';
+        $s = preg_replace($pattern, '', $params[$key]);
+        // collapse repeated commas → single
+        $s = preg_replace('/,+/', ',', $s);
+        // remove comma after { or before }
+        $s = preg_replace('/\{\s*,+/', '{', $s);
+        $s = preg_replace('/,+\s*\}/', '}', $s);
+        $params[$key] = $s;
     }
 
     /**
-     * Deduplicate time-series by metric signature (ignoring chrono_timeframe).
-     * 
-     * @param array $allSeries The list of time-series data to deduplicate.
-     * 
-     * @return array The deduplicated time-series data.
+     * Build a query string, repeating keys for arrays: match[]=a&match[]=b
+     */
+    private function buildQueryString(array $params): string
+    {
+        $parts = [];
+        foreach ($params as $k => $v) {
+            if (is_array($v)) {
+                $name = str_ends_with($k,'[]') ? $k : "{$k}[]";
+                foreach ($v as $x) {
+                    $parts[] = rawurlencode($name).'='.rawurlencode($x);
+                }
+            } else {
+                $parts[] = rawurlencode($k).'='.rawurlencode($v);
+            }
+        }
+        return implode('&',$parts);
+    }
+
+    /**
+     * Stable JSON signature of a metric map (minus synthetic labels)
+     */
+    private function signature(array $met): string
+    {
+        unset($met['chrono_timeframe'], $met['_command']);
+        ksort($met);
+        return json_encode($met);
+    }
+
+    /**
+     * Deduplicate series: group by signature, then flatten all chrono_timeframe slices.
      */
     private function dedupeSeries(array $allSeries): array
     {
-        return $allSeries;
-        $buckets = [];
+        $bySig = [];
         foreach ($allSeries as $s) {
-            $m = $s["metric"];
-            unset($m["chrono_timeframe"]);
-            ksort($m);
-            $sig = json_encode($m);
-            $buckets[$sig][] = $s;
+            $sig = $this->signature($s['metric']);
+            $bySig[$sig][] = $s;
         }
         $out = [];
-        foreach ($buckets as $group) {
-            foreach ($group as $series) {
+        foreach ($bySig as $grp) {
+            foreach ($grp as $series) {
                 $out[] = $series;
             }
         }
@@ -564,86 +649,52 @@ class Proxy
     }
 
     /**
-     * Build lastMonthAverage per signature, with global fallback.
-     *
-     * @param array $seriesList  All merged series including chrono_timeframe tag
-     * @param bool  $isRange     True if matrix (query_range), false if vector (query)
-     * @return array             List of average-series objects (never empty if hist data exists)
+     * Build per-signature lastMonthAverage series.
+     * Averages across 7/14/21/28-day slices, one line per metric signature.
      */
     private function buildLastMonthAverage(array $seriesList, bool $isRange): array
     {
-        $numHist = count($this->historicals) - 1; // always 4 in 7/14/21/28
+        $numHist = count($this->timeframes) - 1; // skip 'current'
         if ($numHist < 1) {
             return [];
         }
 
-        // 1) Group by signature (excluding 'current')
         $groups = [];
+        // group non-current slices by their other labels
         foreach ($seriesList as $s) {
-            $label = $s['metric']['chrono_timeframe'] ?? null;
-            if ($label === 'current') {
+            $tf = $s['metric']['chrono_timeframe'] ?? '';
+            if ($tf === 'current') {
                 continue;
             }
             $m = $s['metric'];
-            unset($m['chrono_timeframe']);
+            unset($m['chrono_timeframe'], $m['_command']);
             ksort($m);
             $sig = json_encode($m);
             $groups[$sig][] = $s;
         }
 
         $out = [];
-
-        // 2) If we found per-signature groups, average each
-        if (!empty($groups)) {
-            foreach ($groups as $sig => $groupSeries) {
-                $sums = [];
-                foreach ($groupSeries as $series) {
-                    $points = $isRange ? $series['values'] : [$series['value']];
-                    foreach ($points as [$ts, $val]) {
-                        $minute = intdiv((int)$ts, 60) * 60;
-                        $sums[$minute] = ($sums[$minute] ?? 0) + (float)$val;
-                    }
-                }
-                ksort($sums);
-                $pts = [];
-                foreach ($sums as $minute => $sum) {
-                    $pts[] = [$minute, (string)($sum / $numHist)];
-                }
-                $metric         = json_decode($sig, true);
-                $metric['chrono_timeframe'] = 'lastMonthAverage';
-                $out[] = [
-                    'metric' => $metric,
-                    $isRange ? 'values' : 'value' => $isRange ? $pts : end($pts),
-                ];
-            }
-        }
-
-        // 3) Global fallback: if no groups, average everything together
-        if (empty($out) && !empty($seriesList)) {
+        foreach ($groups as $sig => $grp) {
             $sums = [];
-            foreach ($seriesList as $s) {
-                if (($s['metric']['chrono_timeframe'] ?? '') === 'current') {
-                    continue;
-                }
-                $points = $isRange ? $s['values'] : [$s['value']];
-                foreach ($points as [$ts, $val]) {
-                    $minute = intdiv((int)$ts, 60) * 60;
-                    $sums[$minute] = ($sums[$minute] ?? 0) + (float)$val;
+            // bucket all points into minute slots
+            foreach ($grp as $series) {
+                $pts = $isRange ? $series['values'] : [$series['value']];
+                foreach ($pts as [$ts, $val]) {
+                    $min = intdiv((int)$ts, 60) * 60;
+                    $sums[$min] = ($sums[$min] ?? 0) + (float)$val;
                 }
             }
             ksort($sums);
-            $pts = [];
-            foreach ($sums as $minute => $sum) {
-                // divide by the count of actual historical series we saw:
-                $pts[] = [$minute, (string)($sum / max(1, count($seriesList) - 1))];
+            $ptsOut = [];
+            foreach ($sums as $min => $sum) {
+                $ptsOut[] = [$min, (string)($sum / $numHist)];
             }
-            $firstMetric = $seriesList[0]['metric'] ?? [];
-            unset($firstMetric['chrono_timeframe']);
-            ksort($firstMetric);
-            $firstMetric['chrono_timeframe'] = 'lastMonthAverage';
+            $metric = json_decode($sig, true);
+            $metric['chrono_timeframe'] = 'lastMonthAverage';
             $out[] = [
-                'metric' => $firstMetric,
-                $isRange ? 'values' : 'value' => $isRange ? $pts : end($pts),
+                'metric' => $metric,
+                $isRange ? 'values' : 'value'
+                    => $isRange ? $ptsOut : end($ptsOut),
             ];
         }
 
@@ -651,107 +702,14 @@ class Proxy
     }
 
     /**
-     * Parse RFC3339 string or integer into epoch seconds.
-     * 
-     * @param mixed $t The time value to parse (string or integer).
-     * 
-     * @return int The parsed epoch seconds.
+     * Parse a Prometheus time (RFC3339 or integer) into epoch seconds.
      */
     private function parseTime($t): int
     {
         if (is_numeric($t)) {
-            return (int) $t;
+            return (int)$t;
         }
-        $ts = strtotime((string) $t);
+        $ts = strtotime((string)$t);
         return $ts !== false ? $ts : time();
-    }
-
-    /**
-     * Parse client-supplied parameters:
-     * - GET → $_GET
-     * - POST JSON → decoded JSON body
-     * - POST form → parse_str on raw body
-     * 
-     * @return array The parsed client parameters.
-     */
-    private function parseClientParams(): array
-    {
-        $method = $_SERVER["REQUEST_METHOD"] ?? "GET";
-        $contentType = $_SERVER["CONTENT_TYPE"] ?? "";
-        $rawBody = file_get_contents("php://input");
-
-        if ($method === "POST") {
-            if (stripos($contentType, "application/json") !== false) {
-                $decoded = json_decode($rawBody, true);
-                return is_array($decoded) ? $decoded : [];
-            } else {
-                parse_str($rawBody, $params);
-                return $params;
-            }
-        }
-
-        // GET (and others)
-        return $_GET;
-    }
-
-    /**
-     * Remove any chrono_timeframe="..." from all match[] filters in $params.
-     * 
-     * @param array $params The query parameters to modify.
-     * 
-     * @return void
-     */
-    private function stripHistoricalFromMatches(array &$params): void
-    {
-        // Grafana (and some clients) send match[] as either 'match' key (array) or 'match[]'
-        $keys = ["match", "match[]"];
-        foreach ($keys as $k) {
-            if (!isset($params[$k])) {
-                continue;
-            }
-            if (is_array($params[$k])) {
-                $params[$k] = array_map(
-                    fn($m) => preg_replace('/[, ]+?chrono_timeframe="[^"]*"/', "", $m),
-                    $params[$k]
-                );
-            } else {
-                $params[$k] = preg_replace(
-                    '/[, ]+?chrono_timeframe="[^"]*"/',
-                    "",
-                    $params[$k]
-                );
-            }
-            $params[$k] = preg_replace(
-                '/, , /',
-                ", ",
-                $params[$k]
-            );
-        }
-    }
-
-    /**
-     * Build a URL-encoded query string from $params,
-     * repeating keys for array values (e.g. match[]=a&match[]=b).
-     * 
-     * @param array $params The query parameters to encode.
-     * 
-     * @return string The URL-encoded query string.
-     */
-    private function buildQueryString(array $params): string
-    {
-        $parts = [];
-        foreach ($params as $key => $value) {
-            if (is_array($value)) {
-                // ensure the param name ends with []
-                $paramName = str_ends_with($key, "[]") ? $key : $key . "[]";
-                foreach ($value as $v) {
-                    $parts[] =
-                        rawurlencode($paramName) . "=" . rawurlencode($v);
-                }
-            } else {
-                $parts[] = rawurlencode($key) . "=" . rawurlencode($value);
-            }
-        }
-        return implode("&", $parts);
     }
 }
