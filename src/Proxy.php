@@ -128,6 +128,8 @@ class Proxy
     ): void {
         $method = strtoupper($server["REQUEST_METHOD"]);
         $contentType = $server["CONTENT_TYPE"] ?? "";
+        $requestedHistorical = null;
+
 
         // parse GET or JSON/form-POST params
         if ($method === "POST") {
@@ -139,6 +141,12 @@ class Proxy
         } else {
             $params = $_GET;
         }
+
+        if (isset($params['query'])
+        && preg_match('/chrono_timeframe="([^"]+)"/', $params['query'], $m)
+    ) {
+        $requestedHistorical = $m[1]; // e.g. "7days" or "lastMonthAverage"
+    }
 
         // strip any user-supplied chrono_timeframe matcher
         $this->stripHistoricalFromParam($params, "query");
@@ -196,6 +204,27 @@ class Proxy
             $merged[] = $avgSeries;
         }
 
+        // if they asked for a single chrono_timeframe slice, filter down to only that
+        if ($requestedHistorical !== null) {
+            $filtered = array_values(array_filter(
+                $merged,
+                fn($s) => ($s['metric']['chrono_timeframe'] ?? '') === $requestedHistorical
+            ));
+
+            header('Content-Type: application/json');
+            echo json_encode([
+                'status' => 'success',
+                'data' => [
+                    'resultType' => 'vector',  
+                    'result'     => $filtered,
+                ],
+            ]);
+            return;
+        }
+
+
+
+
         header("Content-Type: application/json");
         echo json_encode([
             "status" => "success",
@@ -238,6 +267,15 @@ class Proxy
         } else {
             $params = $_GET;
         }
+
+        // detect if the user asked for a specific historical slice
+        $requestedHistorical = null;
+        if (isset($params['query'])
+            && preg_match('/chrono_timeframe="([^"]+)"/', $params['query'], $m)
+        ) {
+            $requestedHistorical = $m[1]; // e.g. "7days" or "lastMonthAverage"
+        }
+
 
         // strip any user-supplied chrono_timeframe matcher
         $this->stripHistoricalFromParam($params, "query");
@@ -306,6 +344,26 @@ if(@$_GET['debug']) print_r("\n\n\n".$histLabel." offset: $offset"." $i\n");
         $avgSeries = $this->buildLastMonthAverage($merged, true);
         if ($avgSeries !== null) {
             $merged[] = $avgSeries;
+        }
+
+
+
+        // if they asked for a single chrono_timeframe slice, filter down to only that
+        if ($requestedHistorical !== null) {
+            $filtered = array_values(array_filter(
+                $merged,
+                fn($s) => ($s['metric']['chrono_timeframe'] ?? '') === $requestedHistorical
+            ));
+
+            header('Content-Type: application/json');
+            echo json_encode([
+                'status' => 'success',
+                'data' => [
+                    'resultType' => 'matrix',    
+                    'result'     => $filtered,
+                ],
+            ]);
+            return;
         }
 
         header("Content-Type: application/json");
