@@ -142,11 +142,12 @@ class Proxy
             $params = $_GET;
         }
 
-        if (isset($params['query'])
-        && preg_match('/chrono_timeframe="([^"]+)"/', $params['query'], $m)
-    ) {
-        $requestedHistorical = $m[1]; // e.g. "7days" or "lastMonthAverage"
-    }
+        if (
+            isset($params['query'])
+            && preg_match('/chrono_timeframe="([^"]+)"/', $params['query'], $m)
+        ) {
+            $requestedHistorical = $m[1]; // e.g. "7days" or "lastMonthAverage"
+        }
 
         // strip any user-supplied chrono_timeframe matcher
         $this->stripHistoricalFromParam($params, "query");
@@ -199,8 +200,9 @@ class Proxy
 
         // dedupe and build the lastMonthAverage series
         $merged = $this->dedupeSeries($allSeries);
-        $avgSeries = $this->buildLastMonthAverage($merged, false);
-        if ($avgSeries !== null) {
+        $avgSeriesA = $this->buildLastMonthAverage($merged, false);
+        // append each per-signature average-series
+        foreach ($avgSeriesA as $avgSeries) {
             $merged[] = $avgSeries;
         }
 
@@ -215,7 +217,7 @@ class Proxy
             echo json_encode([
                 'status' => 'success',
                 'data' => [
-                    'resultType' => 'vector',  
+                    'resultType' => 'vector',
                     'result'     => $filtered,
                 ],
             ]);
@@ -270,7 +272,8 @@ class Proxy
 
         // detect if the user asked for a specific historical slice
         $requestedHistorical = null;
-        if (isset($params['query'])
+        if (
+            isset($params['query'])
             && preg_match('/chrono_timeframe="([^"]+)"/', $params['query'], $m)
         ) {
             $requestedHistorical = $m[1]; // e.g. "7days" or "lastMonthAverage"
@@ -291,11 +294,11 @@ class Proxy
         // fetch 5 windows
         foreach ($this->offsets as $i => $offset) {
             $histLabel = $this->historicals[$i];
-if(@$_GET['debug']) print_r("\n\n\n".$histLabel." offset: $offset"." $i\n");
+            if (@$_GET['ajdebug']) print_r("\n\n\n" . $histLabel . " offset: $offset" . " $i\n");
             // shift start/end backwards
             $params["start"] =
                 $this->parseTime($params["start"] ?? null) - $offset;
-                $params["end"] = $this->parseTime($params["end"] ?? null) - $offset;
+            $params["end"] = $this->parseTime($params["end"] ?? null) - $offset;
 
 
             try {
@@ -318,7 +321,7 @@ if(@$_GET['debug']) print_r("\n\n\n".$histLabel." offset: $offset"." $i\n");
                     "status" => "error",
                     "error" => "Upstream request failed",
                 ]);
-                
+
                 return;
             }
 
@@ -333,16 +336,16 @@ if(@$_GET['debug']) print_r("\n\n\n".$histLabel." offset: $offset"." $i\n");
                 $series["values"] = $shifted;
                 $series["metric"]["chrono_timeframe"] = $histLabel;
                 $allSeries[] = $series;
-                if($histLabel !== "current") {
-                    if(@$_GET['debug']) print_r($series);
+                if ($histLabel !== "current") {
+                    if (@$_GET['debug']) print_r($series);
                 }
             }
         }
 
         // dedupe and build average
         $merged = $this->dedupeSeries($allSeries);
-        $avgSeries = $this->buildLastMonthAverage($merged, true);
-        if ($avgSeries !== null) {
+        $avgSeriesA  = $this->buildLastMonthAverage($merged, true);
+        foreach ($avgSeriesA as $avgSeries) {
             $merged[] = $avgSeries;
         }
 
@@ -359,7 +362,7 @@ if(@$_GET['debug']) print_r("\n\n\n".$histLabel." offset: $offset"." $i\n");
             echo json_encode([
                 'status' => 'success',
                 'data' => [
-                    'resultType' => 'matrix',    
+                    'resultType' => 'matrix',
                     'result'     => $filtered,
                 ],
             ]);
@@ -531,7 +534,6 @@ if(@$_GET['debug']) print_r("\n\n\n".$histLabel." offset: $offset"." $i\n");
             "",
             $params[$key]
         );
-        
     }
 
     /**
@@ -562,86 +564,90 @@ if(@$_GET['debug']) print_r("\n\n\n".$histLabel." offset: $offset"." $i\n");
     }
 
     /**
-     * Build the `lastMonthAverage` series by averaging, per-minute,
-     * across all historical slices (7d,14d,21d,28d).
-     * 
-     * @param array $seriesList All merged series including chrono_timeframe labels.
-     * @param bool $isRange True if this is a query_range (matrix), false for instant (vector).
-     * 
-     * @return array|null A single series in Prometheus format, or null if no data.
+     * Build lastMonthAverage per signature, with global fallback.
+     *
+     * @param array $seriesList  All merged series including chrono_timeframe tag
+     * @param bool  $isRange     True if matrix (query_range), false if vector (query)
+     * @return array             List of average-series objects (never empty if hist data exists)
      */
-    private function buildLastMonthAverage(
-        array $seriesList,
-        bool $isRange
-    ): ?array {
-        // 1) How many historical slices? (we exclude 'current')
-        $numHist = 0;
-        if (count($this->historicals) - 1 <= 0) {
-            return null;
+    private function buildLastMonthAverage(array $seriesList, bool $isRange): array
+    {
+        $numHist = count($this->historicals) - 1; // always 4 in 7/14/21/28
+        if ($numHist < 1) {
+            return [];
         }
 
-        // 2) Sum up all values per-minute
-        $sums = [];
-        foreach ($seriesList as $series) {
-            // skip the 'current' slice
-            if (($series["metric"]["chrono_timeframe"] ?? "") === "current") {
+        // 1) Group by signature (excluding 'current')
+        $groups = [];
+        foreach ($seriesList as $s) {
+            $label = $s['metric']['chrono_timeframe'] ?? null;
+            if ($label === 'current') {
                 continue;
             }
-            $numHist++;
-            // pick the right points array
-            $points = $isRange
-                ? $series["values"] ?? []
-                : [$series["value"] ?? []];
+            $m = $s['metric'];
+            unset($m['chrono_timeframe']);
+            ksort($m);
+            $sig = json_encode($m);
+            $groups[$sig][] = $s;
+        }
 
-            foreach ($points as [$ts, $val]) {
-                // round down to the start of the minute
-                $minute = intdiv((int) $ts, 60) * 60;
-                $sums[$minute] = ($sums[$minute] ?? 0) + (float) $val;
+        $out = [];
+
+        // 2) If we found per-signature groups, average each
+        if (!empty($groups)) {
+            foreach ($groups as $sig => $groupSeries) {
+                $sums = [];
+                foreach ($groupSeries as $series) {
+                    $points = $isRange ? $series['values'] : [$series['value']];
+                    foreach ($points as [$ts, $val]) {
+                        $minute = intdiv((int)$ts, 60) * 60;
+                        $sums[$minute] = ($sums[$minute] ?? 0) + (float)$val;
+                    }
+                }
+                ksort($sums);
+                $pts = [];
+                foreach ($sums as $minute => $sum) {
+                    $pts[] = [$minute, (string)($sum / $numHist)];
+                }
+                $metric         = json_decode($sig, true);
+                $metric['chrono_timeframe'] = 'lastMonthAverage';
+                $out[] = [
+                    'metric' => $metric,
+                    $isRange ? 'values' : 'value' => $isRange ? $pts : end($pts),
+                ];
             }
         }
 
-        if (empty($sums)) {
-            return null;
-        }
-
-        // 3) Divide each sum by the number of historical slices
-        $averages = [];
-        foreach ($sums as $minute => $sum) {
-            $averages[$minute] = (string) ($sum / $numHist);
-        }
-
-        // 4) Sort by timestamp and build points array
-        ksort($averages);
-        $pointsOut = [];
-        foreach ($averages as $minute => $avgVal) {
-            $pointsOut[] = [$minute, $avgVal];
-        }
-
-        // 5) Reconstruct the metric signature (minus the old chrono_timeframe tag)
-        $baseMetric = null;
-        foreach ($seriesList as $series) {
-            if (($series["metric"]["chrono_timeframe"] ?? "") !== "current") {
-                $baseMetric = $series["metric"];
-                break;
+        // 3) Global fallback: if no groups, average everything together
+        if (empty($out) && !empty($seriesList)) {
+            $sums = [];
+            foreach ($seriesList as $s) {
+                if (($s['metric']['chrono_timeframe'] ?? '') === 'current') {
+                    continue;
+                }
+                $points = $isRange ? $s['values'] : [$s['value']];
+                foreach ($points as [$ts, $val]) {
+                    $minute = intdiv((int)$ts, 60) * 60;
+                    $sums[$minute] = ($sums[$minute] ?? 0) + (float)$val;
+                }
             }
-        }
-        $metric = is_array($baseMetric) ? $baseMetric : [];
-        unset($metric["chrono_timeframe"]);
-        ksort($metric);
-        $metric["chrono_timeframe"] = "lastMonthAverage";
-        // 6) Return in the correct Prometheus shape
-        if ($isRange) {
-            return [
-                "metric" => $metric,
-                "values" => $pointsOut,
-            ];
-        } else {
-            // for instant queries, return only the last averaged point
-            return [
-                "metric" => $metric,
-                "value" => end($pointsOut),
+            ksort($sums);
+            $pts = [];
+            foreach ($sums as $minute => $sum) {
+                // divide by the count of actual historical series we saw:
+                $pts[] = [$minute, (string)($sum / max(1, count($seriesList) - 1))];
+            }
+            $firstMetric = $seriesList[0]['metric'] ?? [];
+            unset($firstMetric['chrono_timeframe']);
+            ksort($firstMetric);
+            $firstMetric['chrono_timeframe'] = 'lastMonthAverage';
+            $out[] = [
+                'metric' => $firstMetric,
+                $isRange ? 'values' : 'value' => $isRange ? $pts : end($pts),
             ];
         }
+
+        return $out;
     }
 
     /**
